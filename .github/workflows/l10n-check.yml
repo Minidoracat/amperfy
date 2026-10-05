@@ -1,0 +1,75 @@
+name: l10n check (fork only)
+
+on:
+  push:
+    branches: ['ci/**']
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app && xcodebuild -version
+
+      - name: SwiftFormat lint on changed Swift files
+        run: |
+          cd BuildTools
+          swift build -c release --product swiftformat 2>&1 | tail -2
+          ./.build/release/swiftformat --lint \
+            ../Amperfy/Screens/ViewController/LoginVC.swift \
+            ../AmperfyKit/Api/BackendProxy.swift
+
+      - name: Localization build settings
+        run: |
+          xcodebuild -project Amperfy.xcodeproj -target Amperfy -showBuildSettings 2>/dev/null \
+            | grep -E ' (SWIFT_EMIT_LOC_STRINGS|LOCALIZATION_PREFERS_STRING_CATALOGS|DEVELOPMENT_LANGUAGE) ' || true
+
+      - name: Create simulator
+        run: |
+          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; r=[x for x in json.load(sys.stdin)["runtimes"] if x["platform"]=="iOS" and x["isAvailable"]]; print(r[-1]["identifier"])')
+          DEVTYPE=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; d=[x["identifier"] for x in json.load(sys.stdin)["devicetypes"] if x["name"].startswith("iPhone 17 Pro")]; print(d[0])')
+          echo "runtime=$RUNTIME devicetype=$DEVTYPE"
+          UDID=$(xcrun simctl create l10n "$DEVTYPE" "$RUNTIME")
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild -project Amperfy.xcodeproj -scheme Amperfy -configuration Debug \
+            -destination "platform=iOS Simulator,id=$UDID" -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO build 2>&1 | tee build.log \
+            | grep -E 'error:|warning: .*(LoginVC|BackendProxy|xcstrings)|BUILD (SUCCEEDED|FAILED)'
+
+      - name: Inspect compiled strings
+        run: |
+          APP=build/Build/Products/Debug-iphonesimulator/Amperfy.app
+          ls -d "$APP"/*.lproj "$APP"/Frameworks/AmperfyKit.framework/*.lproj
+          for l in zh-Hant zh-Hans; do
+            echo "== $l app";        plutil -p "$APP/$l.lproj/Localizable.strings"
+            echo "== $l AmperfyKit"; plutil -p "$APP/Frameworks/AmperfyKit.framework/$l.lproj/Localizable.strings"
+          done
+
+      - name: Screenshots
+        run: |
+          xcrun simctl install "$UDID" build/Build/Products/Debug-iphonesimulator/Amperfy.app
+          mkdir -p shots
+          for spec in zh-Hant:zh_TW zh-Hans:zh_CN en:en_US; do
+            lang=${spec%%:*}; locale=${spec#*:}
+            xcrun simctl launch --terminate-running-process "$UDID" de.familie-zimba.amperfy-music \
+              -AppleLanguages "($lang)" -AppleLocale "$locale"
+            sleep 15
+            xcrun simctl io "$UDID" screenshot "shots/login-$lang.png"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: l10n-check
+          path: |
+            shots
+            build.log
